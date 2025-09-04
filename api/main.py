@@ -16,7 +16,7 @@ from model import (
     load_model,                  # for /readyz
     reload_model_from_gridfs,    # for /admin/reload
 )
-from services import interpret_message, evaluate_on_test  # build_auto_exog tidak diperlukan lagi
+from services import interpret_message, evaluate_on_test
 
 # ================== ENV ==================
 MONGODB_URI       = os.getenv("MONGODB_URI")
@@ -31,7 +31,7 @@ ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*")
 ALLOW_ORIGINS     = [o.strip() for o in ALLOW_ORIGINS_ENV.split(",")] if ALLOW_ORIGINS_ENV else ["*"]
 
 # ================== APP & CORS ==================
-app = FastAPI(title="Forecast Backend (SARIMAX + Mongo GridFS)", version="0.5.1")
+app = FastAPI(title="Forecast Backend (SARIMAX + Mongo GridFS)", version="0.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,7 +41,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ================== Pydantic Base (fix protected_namespaces) ==================
+# ================== Pydantic base ==================
 class BaseSchema(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
@@ -53,8 +53,8 @@ class PredictRequest(BaseSchema):
     horizon: int = Field(..., ge=1, le=365)
     frequency: str = "D"
     alpha: float = 0.05
-    # exog manual (opsional): {"columns":[...], "rows":[[...], ...]}
-    exog: Optional[Dict[str, List[List[float]]]] = None
+    # ✨ fleksibel: boleh map-style {col:[...]} atau structured {columns:[...], rows:[[...]]}
+    exog: Optional[Any] = None
     flags: Optional[Flags] = Flags()
 
 class ForecastPoint(BaseSchema):
@@ -79,9 +79,6 @@ class ChatReq(BaseSchema):
 
 # ================== Health helpers ==================
 def _ping_mongo() -> Dict[str, Any]:
-    """
-    Cek koneksi Mongo + info ringan koleksi.
-    """
     info: Dict[str, Any] = {"connected": False, "error": None, "collections": {}}
     try:
         from pymongo import MongoClient
@@ -107,17 +104,13 @@ def _healthz():
     return {"status": "ok"}
 
 def _readyz():
-    # 1) Mongo
     mongo_info = _ping_mongo()
-
-    # 2) GridFS model (file id / length / uploadDate)
     model_info = {}
     try:
-        model_info = load_model()  # lazy: muat / validasi file terbaru
+        model_info = load_model()  # lazy validate GridFS file
     except Exception as e:
         model_info = {"error": f"{type(e).__name__}: {e}"}
 
-    # 3) Meta ringkas
     meta_brief = {}
     try:
         m = read_train_meta(force_reload=True)
@@ -167,10 +160,10 @@ def _meta():
         "model_seasonal_order": m.get("model_seasonal_order"),
     }
 
-# ================== Exog alignment helpers ==================
+# ================== Exog helpers ==================
 def _expected_exog_cols(meta: dict) -> List[str]:
     """
-    Ambil urutan exog dari model (training-time) kalau ada; lalu
+    Ambil urutan exog dari model (training-time) kalau ada; LALU
     buang 'const'/'intercept' karena SARIMAX menambahkan konstanta internal.
     """
     names = meta.get("exog_names_from_model")
@@ -179,48 +172,101 @@ def _expected_exog_cols(meta: dict) -> List[str]:
     cleaned = [c for c in names if str(c).lower() not in ("const", "intercept")]
     return cleaned
 
-def _align_manual_exog(provided: Dict[str, List[List[float]]], expected_cols: List[str], h: int):
+def _to_float(x) -> float:
+    try:
+        return float(x)
+    except Exception:
+        try:
+            return float(str(x).replace(",", ""))
+        except Exception:
+            return 0.0
+
+def _flatten_series(v) -> List[float]:
     """
-    Reindex exog manual: urutkan sesuai expected_cols, isi 0 untuk kolom yang hilang,
-    dan abaikan kolom ekstra. Kembalikan (rows, summary, warnings).
+    Terima:
+      - list 1D: [v1, v2, ...]
+      - list 2D "baris": [[v1], [v2], ...] → flatten ambil elemen pertama
+    """
+    if not isinstance(v, list):
+        return []
+    if v and isinstance(v[0], list):
+        return [_to_float(r[0]) if r else 0.0 for r in v]
+    return [_to_float(z) for z in v]
+
+def _align_exog_flexible(exog: Any, expected_cols: List[str], h: int):
+    """
+    Terima:
+      - structured: {"columns":[...], "rows":[[...], ...]}
+      - map-style:  { "<col>":[...], "<col2>":[...], ... }  (1D atau 2D di-flatten)
+    Kembalikan: (rows_aligned, summary, warnings)
     """
     warnings: List[str] = []
-    cols_in = provided.get("columns", [])
-    rows_in = provided.get("rows", [])
+    if exog is None:
+        return None, {}, warnings
 
-    if len(rows_in) != h:
-        raise HTTPException(400, f"Exog rows must match horizon={h}")
+    # --- Structured {"columns","rows"} ---
+    if isinstance(exog, dict) and "columns" in exog and "rows" in exog:
+        cols_in = list(exog.get("columns") or [])
+        rows_in = list(exog.get("rows") or [])
+        if len(rows_in) != h:
+            raise HTTPException(400, f"Exog rows must match horizon={h}")
 
-    missing = [c for c in expected_cols if c not in cols_in]
-    extra = [c for c in cols_in if c not in expected_cols]
-    if missing:
-        warnings.append(f"Exog columns missing and filled with 0: {missing}")
-    if extra:
-        warnings.append(f"Exog columns ignored (not used by model): {extra}")
+        missing = [c for c in expected_cols if c not in cols_in]
+        extra = [c for c in cols_in if c not in expected_cols]
+        if missing:
+            warnings.append(f"Exog columns missing and filled with 0: {missing}")
+        if extra:
+            warnings.append(f"Exog columns ignored (not used by model): {extra}")
 
-    idx_map = {c: cols_in.index(c) for c in cols_in if c in expected_cols}
-
-    aligned: List[List[float]] = []
-    for r in rows_in:
-        new_row = []
-        for c in expected_cols:
-            if c in idx_map:
-                j = idx_map[c]
-                try:
-                    new_row.append(float(r[j]))
-                except Exception:
+        idx_map = {c: cols_in.index(c) for c in cols_in if c in expected_cols}
+        aligned: List[List[float]] = []
+        for r in rows_in:
+            new_row = []
+            for c in expected_cols:
+                if c in idx_map:
+                    j = idx_map[c]
+                    try:
+                        new_row.append(_to_float(r[j]))
+                    except Exception:
+                        new_row.append(0.0)
+                else:
                     new_row.append(0.0)
-            else:
-                new_row.append(0.0)
-        aligned.append(new_row)
+            aligned.append(new_row)
 
-    summary = {"columns": expected_cols, "source": "manual-aligned", "missing_filled": missing, "extra_ignored": extra}
-    return aligned, summary, warnings
+        summary = {"columns": expected_cols, "source": "manual-structured", "missing_filled": missing, "extra_ignored": extra}
+        return aligned, summary, warnings
+
+    # --- Map-style {"col":[...], "col2":[...]} ---
+    if isinstance(exog, dict):
+        series_by_col: Dict[str, List[float]] = {}
+        for k, v in exog.items():
+            series_by_col[str(k)] = _flatten_series(v)
+
+        missing = [c for c in expected_cols if c not in series_by_col]
+        extra = [c for c in series_by_col.keys() if c not in expected_cols]
+        if missing:
+            warnings.append(f"Exog columns missing and filled with 0: {missing}")
+        if extra:
+            warnings.append(f"Exog columns ignored (not used by model): {extra}")
+
+        aligned: List[List[float]] = []
+        for i in range(h):
+            row = []
+            for c in expected_cols:
+                seq = series_by_col.get(c)
+                val = seq[i] if (seq is not None and i < len(seq)) else 0.0
+                row.append(_to_float(val))
+            aligned.append(row)
+
+        summary = {"columns": expected_cols, "source": "manual-map", "missing_filled": missing, "extra_ignored": extra}
+        return aligned, summary, warnings
+
+    raise HTTPException(400, "Invalid exog format. Use {'columns','rows'} OR {'<col>':[...]} map.")
 
 # ================== Routes (root & /api/* mirrors) ==================
 @app.get("/")
 def root():
-    return {"ok": True, "service": "forecast-backend", "version": "0.5.1"}
+    return {"ok": True, "service": "forecast-backend", "version": "0.6.0"}
 
 @app.get("/healthz")
 def healthz_root(): return _healthz()
@@ -244,10 +290,9 @@ def meta_api(): return _meta()
 @app.post("/predict", response_model=PredictResponse)
 @app.post("/api/predict", response_model=PredictResponse)
 def api_predict(req: PredictRequest):
-    # Refresh meta supaya tidak pakai cache lama
     meta = read_train_meta(force_reload=True)
 
-    # Selalu ikuti kolom ekspektasi dari model (tanpa const/intercept)
+    # Selalu ikuti kolom ekspektasi dari model (drop const/intercept)
     expected_cols = _expected_exog_cols(meta)
     h = req.horizon
     freq = (req.frequency or meta.get("freq") or "D").upper()
@@ -259,7 +304,6 @@ def api_predict(req: PredictRequest):
 
     if expected_cols:  # model butuh exog
         if req.flags and req.flags.use_auto_exog:
-            # AUTO: nol persis sesuai kolom yang diharapkan model
             exog_future = [[0.0] * len(expected_cols) for _ in range(h)]
             exog_summary = {"mode": "zeros", "columns": expected_cols}
             mode = "auto"
@@ -269,12 +313,10 @@ def api_predict(req: PredictRequest):
                     400,
                     "Model requires exogenous variables. Provide 'exog' or set flags.use_auto_exog=true."
                 )
-            # MANUAL: reindex & isi 0 untuk kolom hilang, drop kolom ekstra
-            exog_future, exog_summary, warns = _align_manual_exog(req.exog, expected_cols, h)
+            exog_future, exog_summary, warns = _align_exog_flexible(req.exog, expected_cols, h)
             warnings.extend(warns)
             mode = "manual"
     else:
-        # model TANPA exog → abaikan exog yg dikirim
         mode = "none"
         if req.exog:
             warnings.append("Model does not expect exogenous variables; provided exog is ignored.")
@@ -282,7 +324,6 @@ def api_predict(req: PredictRequest):
     try:
         out = forecast(h=h, alpha=req.alpha, exog_future=exog_future)
     except Exception as e:
-        # bubble up detail (version mismatch, shape mismatch, dll)
         raise HTTPException(status_code=503, detail=str(e))
 
     if out is None:
