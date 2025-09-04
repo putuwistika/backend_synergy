@@ -1,21 +1,23 @@
 # model.py
+# Mongo + GridFS loader for SARIMAX Results, meta from train_df, and forecast wrapper.
 from __future__ import annotations
 
 import os
+from io import BytesIO
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
-from pymongo import MongoClient, ASCENDING, DESCENDING
+from pymongo import MongoClient, DESCENDING
 import gridfs
 
 # ===================== ENV =====================
-MONGODB_URI      = os.getenv("MONGODB_URI")  # wajib di Railway
+MONGODB_URI      = os.getenv("MONGODB_URI")  # REQUIRED (Railway Variables / local env)
 DB_NAME          = os.getenv("DB_NAME", "forecasting_db")
 GRIDFS_BUCKET    = os.getenv("GRIDFS_BUCKET", "models")
 MODEL_FILENAME   = os.getenv("MODEL_FILENAME", "sarimax_model.pkl")
 TRAIN_COLLECTION = os.getenv("TRAIN_COLLECTION", "train_df")
-TEST_COLLECTION  = os.getenv("TEST_COLLECTION", "test_df")  # dipakai di services.py
+TEST_COLLECTION  = os.getenv("TEST_COLLECTION", "test_df")  # used by services.py
 DEFAULT_FREQ     = os.getenv("DEFAULT_FREQ", "D").upper().strip()
 
 # ===================== GLOBAL CACHES =====================
@@ -24,32 +26,29 @@ _db = None
 _gfs: Optional[gridfs.GridFS] = None
 
 _model_cache: Any = None
-_model_file_id: Any = None  # GridFS file _id of cached model
+_model_file_id: Any = None  # GridFS _id for the cached model
 _meta_cache: Optional[Dict[str, Any]] = None
 
-
-# ===================== UTIL: MONGO CONN =====================
+# ===================== MONGO CONNECTION =====================
 def _get_db():
     global _mongo_client, _db, _gfs
     if _db is None:
         if not MONGODB_URI:
-            raise RuntimeError("MONGODB_URI is not set. Please set it in your environment.")
+            raise RuntimeError("MONGODB_URI is not set. Configure it in environment variables.")
         _mongo_client = MongoClient(MONGODB_URI)
         _db = _mongo_client[DB_NAME]
         _gfs = gridfs.GridFS(_db, collection=GRIDFS_BUCKET)
     return _db
-
 
 def _get_gfs() -> gridfs.GridFS:
     if _gfs is None:
         _get_db()
     return _gfs  # type: ignore
 
-
-# ===================== UTIL: DATES =====================
+# ===================== DATE UTILS =====================
 def _parse_date_any(v) -> Optional[date]:
     """
-    Terima string ISO 'YYYY-MM-DD' atau datetime (BSON date dari Mongo).
+    Accepts ISO string 'YYYY-MM-DD', Python datetime/date, or BSON date.
     """
     if v is None:
         return None
@@ -57,18 +56,15 @@ def _parse_date_any(v) -> Optional[date]:
         return v
     if isinstance(v, datetime):
         return v.date()
-    # string
     s = str(v).strip()
-    # ambil 10 char pertama (YYYY-MM-DD) untuk aman
     try:
         return datetime.fromisoformat(s[:10]).date()
     except Exception:
         return None
 
-
 def _infer_freq_from_dates(dates: List[date]) -> str:
     """
-    Heuristik sederhana dari median delta-hari:
+    Very simple heuristic using median day-delta:
       ~1 -> 'D', ~7 -> 'W', >=25 -> 'M'
     """
     if len(dates) < 3:
@@ -87,27 +83,21 @@ def _infer_freq_from_dates(dates: List[date]) -> str:
         return "M"
     return "D"
 
-
 def _days_in_month(y: int, m: int) -> int:
-    if m in (1, 3, 5, 7, 8, 10, 12):
-        return 31
-    if m in (4, 6, 9, 11):
-        return 30
-    # February
+    if m in (1, 3, 5, 7, 8, 10, 12): return 31
+    if m in (4, 6, 9, 11): return 30
     leap = (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0))
     return 29 if leap else 28
-
 
 def _add_months(d: date, n: int) -> date:
     y = d.year + (d.month - 1 + n) // 12
     m = (d.month - 1 + n) % 12 + 1
     return date(y, m, min(d.day, _days_in_month(y, m)))
 
-
-# ===================== LOAD MODEL (GridFS) =====================
+# ===================== GRIDFS HELPERS =====================
 def _latest_gridfs_file():
     """
-    Ambil file GridFS terbaru berdasarkan filename.
+    Fetch latest GridFS file document by filename.
     """
     fs = _get_gfs()
     cursor = fs.find({"filename": MODEL_FILENAME}).sort("uploadDate", DESCENDING).limit(1)
@@ -115,46 +105,50 @@ def _latest_gridfs_file():
         return f
     return None
 
-
 def _load_results_from_bytes(blob: bytes):
     """
-    Unpickle menjadi SARIMAXResults/ARIMAResults.
+    Try official Statsmodels loaders from an in-memory buffer (supports .save() format),
+    then fallback to raw pickle. Return object with .get_forecast() if possible.
     """
-    # 1) SARIMAXResults
+    # 1) SARIMAXResults.load from BytesIO
     try:
         from statsmodels.tsa.statespace.sarimax import SARIMAXResults  # type: ignore
-        import pickle
-        obj = pickle.loads(blob)
-        # obj bisa langsung Results; kalau bukan, biarkan exception di get_forecast nanti
+        buf = BytesIO(blob)
+        obj = SARIMAXResults.load(buf)
         if hasattr(obj, "get_forecast"):
             return obj
-        # beberapa format pickle adalah dict { 'results': Results }
-        if isinstance(obj, dict) and "results" in obj and hasattr(obj["results"], "get_forecast"):
-            return obj["results"]
-        return obj
     except Exception:
         pass
 
-    # 2) ARIMAResults
+    # 2) ARIMAResults.load from BytesIO
     try:
         from statsmodels.tsa.arima.model import ARIMAResults  # type: ignore
+        buf = BytesIO(blob)
+        obj = ARIMAResults.load(buf)
+        if hasattr(obj, "get_forecast"):
+            return obj
+    except Exception:
+        pass
+
+    # 3) Fallback: raw pickle (for pickle.dump of the results object)
+    try:
         import pickle
         obj = pickle.loads(blob)
         if hasattr(obj, "get_forecast"):
             return obj
-        return obj
+        if isinstance(obj, dict):
+            for key in ("results", "res", "fitted", "fitted_results", "arima_results", "sarimax_results"):
+                cand = obj.get(key)
+                if hasattr(cand, "get_forecast"):
+                    return cand
+        return None
     except Exception:
-        import pickle
-        try:
-            return pickle.loads(blob)  # last resort
-        except Exception:
-            return None
-
+        return None
 
 def reload_model_from_gridfs() -> Dict[str, Any]:
     """
-    Force reload model dari GridFS, isi cache.
-    Return informasi file (id, length, uploadDate).
+    Force reload model from GridFS into memory cache.
+    Returns info about the loaded file.
     """
     global _model_cache, _model_file_id
     latest = _latest_gridfs_file()
@@ -170,16 +164,17 @@ def reload_model_from_gridfs() -> Dict[str, Any]:
     _model_file_id = latest._id
     return {
         "file_id": str(latest._id),
-        "length": latest.length,
-        "uploadDate": latest.uploadDate.isoformat() if hasattr(latest, "uploadDate") else None,
-        "filename": latest.filename,
+        "length": getattr(latest, "length", None),
+        "uploadDate": getattr(latest, "uploadDate", None).isoformat() if getattr(latest, "uploadDate", None) else None,
+        "filename": getattr(latest, "filename", None),
         "bucket": GRIDFS_BUCKET,
+        "class_name": obj.__class__.__name__,
     }
 
-
-def load_model():
+def load_model() -> Dict[str, Any]:
     """
-    Lazy-load model: jika cache kosong atau file GridFS terbaru beda, reload.
+    Lazy-load model: if cache empty or GridFS file changed, reload.
+    Returns info about the currently loaded file.
     """
     global _model_cache, _model_file_id
     latest = _latest_gridfs_file()
@@ -187,29 +182,27 @@ def load_model():
         raise RuntimeError(f"gridfs_not_found: filename '{MODEL_FILENAME}' not found in bucket '{GRIDFS_BUCKET}.files'")
 
     if _model_cache is None or str(_model_file_id) != str(latest._id):
-        # reload
         return reload_model_from_gridfs()
-    # sudah up-to-date
+    # Already up to date
     return {
         "file_id": str(latest._id),
-        "length": latest.length,
-        "uploadDate": latest.uploadDate.isoformat() if hasattr(latest, "uploadDate") else None,
-        "filename": latest.filename,
+        "length": getattr(latest, "length", None),
+        "uploadDate": getattr(latest, "uploadDate", None).isoformat() if getattr(latest, "uploadDate", None) else None,
+        "filename": getattr(latest, "filename", None),
         "bucket": GRIDFS_BUCKET,
+        "class_name": _model_cache.__class__.__name__ if _model_cache is not None else None,
     }
 
-
-# ===================== META (dari train_df di Mongo) =====================
+# ===================== META (from train_df in Mongo) =====================
 def _detect_cols_from_sample(doc: Dict[str, Any]) -> Tuple[str, str, List[str]]:
     """
-    Deteksi date & target col dari dokumen contoh.
+    Infer date & target columns from a sample document.
     """
     keys = [k for k in doc.keys() if k != "_id"]
     lower = {k.lower(): k for k in keys}
 
     date_col = lower.get("date") or lower.get("ds")
     if not date_col:
-        # cari field pertama yang bisa diparse ke date
         for k in keys:
             if _parse_date_any(doc.get(k)) is not None:
                 date_col = k
@@ -219,7 +212,6 @@ def _detect_cols_from_sample(doc: Dict[str, Any]) -> Tuple[str, str, List[str]]:
 
     target_col = lower.get("revenue") or lower.get("y") or lower.get("value") or lower.get("target")
     if not target_col:
-        # ambil numeric non-date pertama
         for k in keys:
             if k == date_col:
                 continue
@@ -236,10 +228,9 @@ def _detect_cols_from_sample(doc: Dict[str, Any]) -> Tuple[str, str, List[str]]:
     exog_cols = [k for k in keys if k not in {date_col, target_col}]
     return date_col, target_col, exog_cols
 
-
 def _train_date_range(db, col_name: str, date_col: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    Gunakan aggregation untuk min/max tanggal (string ISO atau BSON date).
+    Use aggregation to compute min/max on date_col (string ISO or BSON date).
     """
     col = db[col_name]
     pipeline = [
@@ -254,13 +245,11 @@ def _train_date_range(db, col_name: str, date_col: str) -> Tuple[Optional[str], 
     dmax = _parse_date_any(res[0].get("max"))
     return (dmin.isoformat() if dmin else None, dmax.isoformat() if dmax else None)
 
-
 def _infer_freq_from_collection(db, col_name: str, date_col: str, sample_n: int = 200) -> str:
     """
-    Ambil hingga sample_n tanggal terakhir (ascending), infer freq.
+    Take up to sample_n latest dates (ascending) and infer frequency.
     """
     col = db[col_name]
-    # ambil ascending dari tail: sort desc limit sample_n, lalu balik
     cursor = col.find(
         {date_col: {"$exists": True, "$ne": None}},
         projection={date_col: 1, "_id": 0}
@@ -269,15 +258,14 @@ def _infer_freq_from_collection(db, col_name: str, date_col: str, sample_n: int 
     dates = [d for d in reversed(dates_desc) if d is not None]
     return _infer_freq_from_dates(dates) if dates else (DEFAULT_FREQ or "D")
 
-
 def read_train_meta(force_reload: bool = False) -> Dict[str, Any]:
     """
-    Baca meta dari koleksi train_df + info model.
-    - date_col, target_col, exog_columns
-    - train_range {start,end}
-    - freq
-    - model_order, model_seasonal_order
-    - exog_names_from_model (jika ada)
+    Build meta from train_df collection + model info:
+      - date_col, target_col, exog_columns
+      - train_range {start,end}
+      - freq
+      - model_order, model_seasonal_order
+      - exog_names_from_model (if available)
     """
     global _meta_cache
     if _meta_cache is not None and not force_reload:
@@ -302,13 +290,10 @@ def read_train_meta(force_reload: bool = False) -> Dict[str, Any]:
         return meta
 
     date_col, target_col, exog_cols = _detect_cols_from_sample(sample)
-
-    # range tanggal & freq
     dmin, dmax = _train_date_range(db, TRAIN_COLLECTION, date_col)
     freq = _infer_freq_from_collection(db, TRAIN_COLLECTION, date_col)
 
-    # info dari model
-    # pastikan model sudah termuat (atau coba load sekali)
+    # Ensure model is loaded (to read model attributes)
     try:
         load_model()
     except Exception:
@@ -327,7 +312,7 @@ def read_train_meta(force_reload: bool = False) -> Dict[str, Any]:
             exog_names = getattr(_model_cache.model, "exog_names", None)
             if exog_names and isinstance(exog_names, (list, tuple)):
                 exog_names_from_model = list(exog_names)
-                # sinkronkan urutan exog ke urutan saat training
+                # Align exog_columns to training-time order
                 exog_cols = list(exog_names_from_model)
         except Exception:
             pass
@@ -345,11 +330,10 @@ def read_train_meta(force_reload: bool = False) -> Dict[str, Any]:
     _meta_cache = meta
     return meta
 
-
 # ===================== FUTURE DATES =====================
 def next_dates_from_train(h: int, freq: str = "D") -> List[str]:
     """
-    Bangun tanggal masa depan sepanjang h berdasarkan last date di train_df.
+    Build future dates after the last train date.
     """
     meta = read_train_meta()
     last = meta.get("train_range", {}).get("end")
@@ -359,20 +343,17 @@ def next_dates_from_train(h: int, freq: str = "D") -> List[str]:
         start = datetime.utcnow().date()
 
     f = (freq or meta.get("freq") or "D").upper()
-    out: List[str] = []
     if f == "W":
-        out = [(start + timedelta(days=7 * i)).isoformat() for i in range(1, h + 1)]
-    elif f == "M":
-        out = [_add_months(start, i).isoformat() for i in range(1, h + 1)]
-    else:
-        out = [(start + timedelta(days=i)).isoformat() for i in range(1, h + 1)]
-    return out
-
+        return [(start + timedelta(days=7 * i)).isoformat() for i in range(1, h + 1)]
+    if f == "M":
+        return [_add_months(start, i).isoformat() for i in range(1, h + 1)]
+    # default 'D'
+    return [(start + timedelta(days=i)).isoformat() for i in range(1, h + 1)]
 
 # ===================== FORECAST WRAPPER =====================
 def _to_numpy_2d(ci_obj) -> np.ndarray:
     """
-    Pastikan conf_int -> ndarray shape (h,2)
+    Ensure conf_int result -> ndarray shape (h, 2)
     """
     if isinstance(ci_obj, np.ndarray):
         arr = ci_obj
@@ -386,16 +367,14 @@ def _to_numpy_2d(ci_obj) -> np.ndarray:
     h = arr.shape[0] if arr.ndim >= 1 else 0
     return np.full((h, 2), np.nan, dtype=float)
 
-
 def forecast(h: int, alpha: float = 0.05,
              exog_future: Optional[List[List[float]]] = None
              ) -> Tuple[List[float], List[float], List[float]]:
     """
-    Jalankan forecasting dengan model dari GridFS.
-    Return (mean, lower, upper) sebagai list float.
+    Run forecasting using the cached model from GridFS.
+    Returns (mean, lower, upper) lists.
     """
-    # pastikan model cache up-to-date
-    load_model()
+    load_model()  # ensure cache up to date
     if _model_cache is None:
         raise RuntimeError("model_not_loaded: no model in cache")
 
@@ -406,13 +385,10 @@ def forecast(h: int, alpha: float = 0.05,
             mean = mean.to_numpy()
         else:
             mean = np.asarray(mean)
-
         ci = res.conf_int(alpha=alpha)
         ci_np = _to_numpy_2d(ci)
-
         lower = ci_np[:, 0] if ci_np.size else np.full(h, np.nan)
         upper = ci_np[:, 1] if ci_np.size else np.full(h, np.nan)
-
         return mean.astype(float).tolist(), lower.astype(float).tolist(), upper.astype(float).tolist()
     except Exception as e:
         import traceback; traceback.print_exc()
