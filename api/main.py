@@ -16,7 +16,7 @@ from model import (
     load_model,                  # for /readyz
     reload_model_from_gridfs,    # for /admin/reload
 )
-from services import interpret_message, evaluate_on_test
+from services import interpret_message, evaluate_on_test, build_smart_exog
 
 # ================== ENV ==================
 MONGODB_URI       = os.getenv("MONGODB_URI")
@@ -31,7 +31,7 @@ ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*")
 ALLOW_ORIGINS     = [o.strip() for o in ALLOW_ORIGINS_ENV.split(",")] if ALLOW_ORIGINS_ENV else ["*"]
 
 # ================== APP & CORS ==================
-app = FastAPI(title="Forecast Backend (SARIMAX + Mongo GridFS)", version="0.6.0")
+app = FastAPI(title="Forecast Backend (SARIMAX + Mongo GridFS)", version="0.7.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,6 +48,9 @@ class BaseSchema(BaseModel):
 # ================== Schemas ==================
 class Flags(BaseSchema):
     use_auto_exog: Optional[bool] = False
+    exog_strategy: Optional[str] = "zeros"       # "zeros" | "smart"
+    clip_non_negative: Optional[bool] = False    # clip output >= floor
+    floor: Optional[float] = 0.0
 
 class PredictRequest(BaseSchema):
     horizon: int = Field(..., ge=1, le=365)
@@ -266,7 +269,7 @@ def _align_exog_flexible(exog: Any, expected_cols: List[str], h: int):
 # ================== Routes (root & /api/* mirrors) ==================
 @app.get("/")
 def root():
-    return {"ok": True, "service": "forecast-backend", "version": "0.6.0"}
+    return {"ok": True, "service": "forecast-backend", "version": "0.7.0"}
 
 @app.get("/healthz")
 def healthz_root(): return _healthz()
@@ -292,7 +295,7 @@ def meta_api(): return _meta()
 def api_predict(req: PredictRequest):
     meta = read_train_meta(force_reload=True)
 
-    # Selalu ikuti kolom ekspektasi dari model (drop const/intercept)
+    # Kolom eksog yang dipakai model (drop const/intercept)
     expected_cols = _expected_exog_cols(meta)
     h = req.horizon
     freq = (req.frequency or meta.get("freq") or "D").upper()
@@ -302,10 +305,18 @@ def api_predict(req: PredictRequest):
     exog_future: Optional[List[List[float]]] = None
     mode = "none"
 
+    # Precompute future dates (dipakai juga oleh smart-exog)
+    dates = next_dates_from_train(h, freq=freq)
+
     if expected_cols:  # model butuh exog
         if req.flags and req.flags.use_auto_exog:
-            exog_future = [[0.0] * len(expected_cols) for _ in range(h)]
-            exog_summary = {"mode": "zeros", "columns": expected_cols}
+            strategy = (req.flags.exog_strategy or "zeros").lower()
+            if strategy == "smart":
+                exog_future, exog_summary, warns = build_smart_exog(h, expected_cols, dates)
+                warnings.extend(warns)
+            else:
+                exog_future = [[0.0] * len(expected_cols) for _ in range(h)]
+                exog_summary = {"mode": "zeros", "columns": expected_cols}
             mode = "auto"
         else:
             if not req.exog:
@@ -333,7 +344,15 @@ def api_predict(req: PredictRequest):
         )
 
     mean, lower, upper = out
-    dates = next_dates_from_train(h, freq=freq)
+
+    # (Opsional) Clip output supaya tidak negatif (untuk tampilan)
+    clip = bool(getattr(req.flags, "clip_non_negative", False))
+    floor = float(getattr(req.flags, "floor", 0.0) or 0.0)
+    if clip:
+        mean = [max(floor, float(v)) for v in mean]
+        if lower: lower = [max(floor, float(v)) for v in lower]
+        if upper: upper = [max(floor, float(v)) for v in upper]
+        warnings.append(f"Output clipped to >= {floor}. Prediction intervals no longer exact.")
 
     points = [
         ForecastPoint(

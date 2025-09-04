@@ -1,5 +1,5 @@
 # services.py
-# Mongo-ready services: auto-exog, chat interpretation, and test-set metrics
+# Mongo-ready services: smart/zero auto-exog, chat interpretation, and test-set metrics
 from __future__ import annotations
 
 import os
@@ -7,14 +7,15 @@ from datetime import datetime, date
 from typing import List, Dict, Tuple, Optional, Any
 
 import numpy as np
-from pymongo import MongoClient, ASCENDING
+from pymongo import MongoClient, ASCENDING, DESCENDING
 
 from model import read_train_meta, forecast  # meta & forecast dari model.py
 
 # ===================== ENV & Mongo =====================
-MONGODB_URI      = os.getenv("MONGODB_URI")
-DB_NAME          = os.getenv("DB_NAME", "forecasting_db")
-TEST_COLLECTION  = os.getenv("TEST_COLLECTION", "test_df")
+MONGODB_URI       = os.getenv("MONGODB_URI")
+DB_NAME           = os.getenv("DB_NAME", "forecasting_db")
+TEST_COLLECTION   = os.getenv("TEST_COLLECTION", "test_df")
+TRAIN_COLLECTION  = os.getenv("TRAIN_COLLECTION", "train_df")
 
 _client: Optional[MongoClient] = None
 _db = None
@@ -64,7 +65,7 @@ def _expected_exog_cols(meta: dict) -> List[str]:
     cleaned = [c for c in names if str(c).lower() not in ("const", "intercept")]
     return cleaned
 
-# ===================== AUTO-EXOG (opsional, masih berguna) =====================
+# ===================== AUTO-EXOG: ZEROS =====================
 def build_auto_exog(h: int, exog_cols: List[str]) -> Tuple[List[List[float]], Dict[str, Any], List[str]]:
     """
     Baseline ringan: isi 0.0 untuk semua kolom exog (aman untuk 'tanpa exog').
@@ -75,6 +76,114 @@ def build_auto_exog(h: int, exog_cols: List[str]) -> Tuple[List[List[float]], Di
     X = [[0.0 for _ in exog_cols] for _ in range(h)]
     summary = {"mode": "zeros", "columns": exog_cols}
     return X, summary, warnings
+
+# ===================== AUTO-EXOG: SMART =====================
+def build_smart_exog(h: int,
+                     expected_cols: List[str],
+                     future_dates: List[str],
+                     lookback_days: int = 60) -> Tuple[List[List[float]], Dict[str, Any], List[str]]:
+    """
+    Isi exog dengan nilai historis yang masuk akal dari train_df:
+      - 'Month'/'Day of Week'/'Weekend Flag' diambil dari tanggal future (ISO 'YYYY-MM-DD')
+      - 'Seasonality' = 1.0 (placeholder)
+      - Fitur numerik ('Room Nights', 'ADR', 'Length of Stay', 'Meal Plan', 'Room Category') = rata-rata lookback_days terakhir
+      - Channel one-hot = 0.0 (bisa ditingkatkan jadi proporsi historis kalau dibutuhkan)
+    """
+    warnings: List[str] = []
+    db = _get_db()
+    meta = read_train_meta(force_reload=False)
+    date_col = meta.get("date_col", "Date")
+
+    # Ambil dokumen terbaru untuk baseline numerik
+    try:
+        proj = {date_col: 1, "_id": 0}
+        for c in expected_cols:
+            proj[c] = 1
+        docs = list(
+            db[TRAIN_COLLECTION]
+            .find({}, proj)
+            .sort(date_col, DESCENDING)
+            .limit(max(lookback_days, 1))
+        )
+    except Exception as e:
+        warnings.append(f"Failed to read train_df for smart exog: {type(e).__name__}: {e}")
+        # fallback zeros
+        X = [[0.0 for _ in expected_cols] for _ in range(h)]
+        return X, {"mode": "smart(fallback-zeros)", "columns": expected_cols}, warnings
+
+    # Helper mean aman
+    def mean_of(col: str) -> float:
+        vals: List[float] = []
+        for d in docs:
+            v = d.get(col)
+            try:
+                vals.append(float(v))
+            except Exception:
+                pass
+        if not vals:
+            return 0.0
+        try:
+            return float(np.nanmean(vals))
+        except Exception:
+            return 0.0
+
+    # Precompute baseline numerik dari train recent
+    numeric_candidates = [
+        "Room Nights", "ADR", "Length of Stay", "Meal Plan", "Room Category", "Seasonality"
+    ]
+    baseline: Dict[str, float] = {c: mean_of(c) for c in numeric_candidates if c in expected_cols}
+    if "Seasonality" in expected_cols and "Seasonality" not in baseline:
+        baseline["Seasonality"] = 1.0
+
+    # Tanggal → fitur kalender
+    def _dow_of(ds: str) -> int:
+        try:
+            return datetime.fromisoformat(ds).weekday()  # 0=Mon..6=Sun
+        except Exception:
+            return 0
+
+    def _month_of(ds: str) -> int:
+        try:
+            return datetime.fromisoformat(ds).month
+        except Exception:
+            return 1
+
+    def _weekend_of(ds: str) -> int:
+        d = _dow_of(ds)
+        return 1 if d in (5, 6) else 0  # Sabtu/Minggu
+
+    # Rakit baris exog sesuai urutan expected_cols
+    rows: List[List[float]] = []
+    for ds in future_dates:
+        row: List[float] = []
+        for c in expected_cols:
+            lc = c.lower()
+            if lc == "month":
+                row.append(float(_month_of(ds)))
+            elif lc == "day of week":
+                row.append(float(_dow_of(ds)))
+            elif lc == "weekend flag":
+                row.append(float(_weekend_of(ds)))
+            elif lc == "seasonality":
+                row.append(float(baseline.get("Seasonality", 1.0)))
+            elif c in baseline:
+                row.append(float(baseline[c]))
+            elif c.startswith("Channel Name_"):
+                # Simpel: 0 semua. (Bisa diganti proporsi historis jika perlu.)
+                row.append(0.0)
+            else:
+                # kolom lain yang tidak termasuk di atas → 0
+                row.append(0.0)
+        rows.append(row)
+
+    summary = {
+        "mode": "smart",
+        "columns": expected_cols,
+        "source": "train_df_recent_means",
+        "lookback_days": lookback_days,
+        "notes": "Month/DOW/Weekend derived from future dates; numerics=recent means; channels=0"
+    }
+    return rows, summary, warnings
 
 # ===================== CHAT INTERPRETER =====================
 def interpret_message(msg: str) -> Dict[str, Any]:
