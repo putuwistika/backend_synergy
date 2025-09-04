@@ -188,14 +188,19 @@ def build_smart_exog(h: int,
 # ===================== CHAT INTERPRETER =====================
 def interpret_message(msg: str) -> Dict[str, Any]:
     """
-    Contoh yang dikenali:
-      - "forecast 15 hari", "forecast 6 minggu", "forecast 3 bulan"
-      - "tanpa exog" -> flags.use_auto_exog = True
-    Default: 14 hari (D)
+    Chat intent parser:
+      - Horizon & freq: "forecast 15 hari|minggu|bulan"
+      - Exog:
+          * "smart exog" / "exog smart" / "smart ... exog" -> use_auto_exog=True, exog_strategy="smart"
+          * "tanpa exog" / "no exog" / "without exog" / "auto exog" / "zeros exog" -> use_auto_exog=True (zeros)
+      - Clipping (non-negative):
+          * "tanpa minus" / "no minus" / "non-negative" / "non-negatif" / "jangan minus" / "clip"
+            -> clip_non_negative=True, optional "floor=<angka>"
     """
     txt = (msg or "").strip().lower()
     import re
 
+    # --- default horizon & freq ---
     horizon, freq = 14, "D"
     m = re.search(r"forecast\s+(\d+)\s*(hari|minggu|bulan|day|week|month)?", txt)
     if m:
@@ -210,9 +215,35 @@ def interpret_message(msg: str) -> Dict[str, Any]:
         else:
             horizon, freq = n, "D"
 
-    flags = {}
-    if "tanpa exog" in txt or "no exog" in txt or "auto exog" in txt:
-        flags = {"use_auto_exog": True}
+    flags: Dict[str, Any] = {}
+
+    # --- exog strategy ---
+    smart_exog = bool(
+        re.search(r"\bsmart\s+exog\b|\bexog\s+smart\b", txt)
+        or ("smart" in txt and "exog" in txt)
+    )
+    if smart_exog:
+        flags["use_auto_exog"] = True
+        flags["exog_strategy"] = "smart"
+    else:
+        # fallback: zeros exog bila user bilang "tanpa exog" / "no exog" / "auto exog"
+        if re.search(r"\b(tanpa|no|without)\s+exog\b", txt) or "auto exog" in txt or "zeros exog" in txt:
+            flags["use_auto_exog"] = True
+            # exog_strategy dibiarkan default "zeros" (dibaca di main.py)
+
+    # --- clipping non-negative ---
+    if re.search(r"(tanpa\s+minus|no\s+minus|non[- ]?negative|non[- ]?negatif|jangan\s+minus|\bclip\b)", txt):
+        flags["clip_non_negative"] = True
+        # optional: floor=...
+        floor_m = re.search(r"(floor|min|batas(?:\s+bawah)?)\s*[:=]\s*([0-9][0-9_.,]*)", txt)
+        if floor_m:
+            num = floor_m.group(2).replace("_", "").replace(",", "")
+            try:
+                flags["floor"] = float(num)
+            except Exception:
+                flags["floor"] = 0.0
+        else:
+            flags.setdefault("floor", 0.0)
 
     return {
         "intent": "forecast",
@@ -220,6 +251,7 @@ def interpret_message(msg: str) -> Dict[str, Any]:
         "frequency": freq,
         "flags": flags
     }
+
 
 # ===================== READ TEST DATA (Mongo) =====================
 def _read_test_from_mongo(meta: Dict[str, Any],
