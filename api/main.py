@@ -14,25 +14,25 @@ from model import (
     read_train_meta,
     next_dates_from_train,
     forecast,
-    load_model,                  # untuk /readyz
-    reload_model_from_gridfs,    # untuk /admin/reload
+    load_model,                  # for /readyz
+    reload_model_from_gridfs,    # for /admin/reload
 )
 from services import build_auto_exog, interpret_message, evaluate_on_test
 
 # ================== ENV ==================
-MONGODB_URI      = os.getenv("MONGODB_URI")
-DB_NAME          = os.getenv("DB_NAME", "forecasting_db")
-GRIDFS_BUCKET    = os.getenv("GRIDFS_BUCKET", "models")
-MODEL_FILENAME   = os.getenv("MODEL_FILENAME", "sarimax_model.pkl")
-TRAIN_COLLECTION = os.getenv("TRAIN_COLLECTION", "train_df")
-TEST_COLLECTION  = os.getenv("TEST_COLLECTION", "test_df")
+MONGODB_URI       = os.getenv("MONGODB_URI")
+DB_NAME           = os.getenv("DB_NAME", "forecasting_db")
+GRIDFS_BUCKET     = os.getenv("GRIDFS_BUCKET", "models")
+MODEL_FILENAME    = os.getenv("MODEL_FILENAME", "sarimax_model.pkl")
+TRAIN_COLLECTION  = os.getenv("TRAIN_COLLECTION", "train_df")
+TEST_COLLECTION   = os.getenv("TEST_COLLECTION", "test_df")
 
-DEFAULT_FREQ     = os.getenv("DEFAULT_FREQ", "D")
+DEFAULT_FREQ      = os.getenv("DEFAULT_FREQ", "D")
 ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*")
-ALLOW_ORIGINS = [o.strip() for o in ALLOW_ORIGINS_ENV.split(",")] if ALLOW_ORIGINS_ENV else ["*"]
+ALLOW_ORIGINS     = [o.strip() for o in ALLOW_ORIGINS_ENV.split(",")] if ALLOW_ORIGINS_ENV else ["*"]
 
 # ================== APP & CORS ==================
-app = FastAPI(title="Forecast Backend (SARIMAX + Mongo GridFS)", version="0.4.0")
+app = FastAPI(title="Forecast Backend (SARIMAX + Mongo GridFS)", version="0.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -94,7 +94,6 @@ def _ping_mongo() -> Dict[str, Any]:
         client.admin.command("ping")
         db = client[DB_NAME]
         info["connected"] = True
-        # gunakan estimated_document_count agar ringan
         try:
             info["collections"] = {
                 "train_df_count": db[TRAIN_COLLECTION].estimated_document_count(),
@@ -123,11 +122,12 @@ def _readyz():
     # 3) Meta ringkas
     meta_brief = {}
     try:
-        m = read_train_meta()
+        m = read_train_meta(force_reload=True)
         meta_brief = {
             "date_col": m.get("date_col"),
             "target_col": m.get("target_col"),
             "exog_columns_len": len(m.get("exog_columns", []) or []),
+            "exog_from_model_len": len(m.get("exog_names_from_model") or []),
             "freq": m.get("freq"),
             "train_range": m.get("train_range"),
             "model_order": m.get("model_order"),
@@ -156,7 +156,7 @@ def _readyz():
     }
 
 def _meta():
-    m = read_train_meta()
+    m = read_train_meta(force_reload=True)
     return {
         "model_name": "sarimax",
         "default_freq": m.get("freq", DEFAULT_FREQ),
@@ -169,10 +169,58 @@ def _meta():
         "model_seasonal_order": m.get("model_seasonal_order"),
     }
 
+# ================== Exog alignment helpers ==================
+def _expected_exog_cols(meta: dict) -> List[str]:
+    """
+    Ambil urutan exog dari model (training-time) kalau ada; kalau tidak, pakai meta.exog_columns.
+    """
+    names = meta.get("exog_names_from_model")
+    if names and isinstance(names, list):
+        return names
+    return meta.get("exog_columns", []) or []
+
+def _align_manual_exog(provided: Dict[str, List[List[float]]], expected_cols: List[str], h: int):
+    """
+    Reindex exog manual: urutkan sesuai expected_cols, isi 0 untuk kolom yang hilang,
+    dan abaikan kolom ekstra. Kembalikan (rows, summary, warnings).
+    """
+    warnings: List[str] = []
+    cols_in = provided.get("columns", [])
+    rows_in = provided.get("rows", [])
+
+    if len(rows_in) != h:
+        raise HTTPException(400, f"Exog rows must match horizon={h}")
+
+    missing = [c for c in expected_cols if c not in cols_in]
+    extra = [c for c in cols_in if c not in expected_cols]
+    if missing:
+        warnings.append(f"Exog columns missing and filled with 0: {missing}")
+    if extra:
+        warnings.append(f"Exog columns ignored (not used by model): {extra}")
+
+    idx_map = {c: cols_in.index(c) for c in cols_in if c in expected_cols}
+
+    aligned: List[List[float]] = []
+    for r in rows_in:
+        new_row = []
+        for c in expected_cols:
+            if c in idx_map:
+                j = idx_map[c]
+                try:
+                    new_row.append(float(r[j]))
+                except Exception:
+                    new_row.append(0.0)
+            else:
+                new_row.append(0.0)
+        aligned.append(new_row)
+
+    summary = {"columns": expected_cols, "source": "manual-aligned", "missing_filled": missing, "extra_ignored": extra}
+    return aligned, summary, warnings
+
 # ================== Routes (root & /api/* mirrors) ==================
 @app.get("/")
 def root():
-    return {"ok": True, "service": "forecast-backend", "version": "0.4.0"}
+    return {"ok": True, "service": "forecast-backend", "version": "0.5.0"}
 
 @app.get("/healthz")
 def healthz_root(): return _healthz()
@@ -196,8 +244,11 @@ def meta_api(): return _meta()
 @app.post("/predict", response_model=PredictResponse)
 @app.post("/api/predict", response_model=PredictResponse)
 def api_predict(req: PredictRequest):
-    meta = read_train_meta()
-    exog_cols = meta.get("exog_columns", [])
+    # Refresh meta supaya tidak pakai cache lama
+    meta = read_train_meta(force_reload=True)
+
+    # Selalu ikuti kolom ekspektasi dari model (kalau ada)
+    expected_cols = _expected_exog_cols(meta)
     h = req.horizon
     freq = (req.frequency or meta.get("freq") or "D").upper()
 
@@ -206,33 +257,27 @@ def api_predict(req: PredictRequest):
     exog_future: Optional[List[List[float]]] = None
     mode = "none"
 
-    if exog_cols:
-        mode = "manual"
+    if expected_cols:  # model butuh exog
         if req.flags and req.flags.use_auto_exog:
-            exog_future, exog_summary, w = build_auto_exog(h, exog_cols)
-            warnings.extend(w)
+            # AUTO: nol persis sesuai kolom yang diharapkan model
+            exog_future = [[0.0] * len(expected_cols) for _ in range(h)]
+            exog_summary = {"mode": "zeros", "columns": expected_cols}
             mode = "auto"
         else:
-            # Manual exog expected
             if not req.exog:
                 raise HTTPException(
-                    status_code=400,
-                    detail="Model requires exogenous variables. Provide 'exog' or set flags.use_auto_exog=true."
+                    400,
+                    "Model requires exogenous variables. Provide 'exog' or set flags.use_auto_exog=true."
                 )
-            cols = req.exog.get("columns", [])
-            rows = req.exog.get("rows", [])
-            if cols != exog_cols:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Exog columns mismatch. Expected {exog_cols}, got {cols}"
-                )
-            if len(rows) != h:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Exog rows must match horizon={h}"
-                )
-            exog_future = rows
-            exog_summary = {"columns": cols, "source": "manual"}
+            # MANUAL: reindex & isi 0 untuk kolom hilang, drop kolom ekstra
+            exog_future, exog_summary, warns = _align_manual_exog(req.exog, expected_cols, h)
+            warnings.extend(warns)
+            mode = "manual"
+    else:
+        # model TANPA exog → abaikan exog yg dikirim
+        mode = "none"
+        if req.exog:
+            warnings.append("Model does not expect exogenous variables; provided exog is ignored.")
 
     try:
         out = forecast(h=h, alpha=req.alpha, exog_future=exog_future)
@@ -303,7 +348,18 @@ def admin_reload_model():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ================== Debug Versions ==================
+# ================== Debug: expected exog & versions ==================
+@app.get("/debug/exog")
+@app.get("/api/debug/exog")
+def debug_exog():
+    m = read_train_meta(force_reload=True)
+    return {
+        "expected_exog_from_model": m.get("exog_names_from_model"),
+        "exog_columns_meta": m.get("exog_columns"),
+        "freq": m.get("freq"),
+        "train_range": m.get("train_range"),
+    }
+
 from importlib.metadata import version as _pkgver, PackageNotFoundError
 import sys
 def _v(pkg: str):
