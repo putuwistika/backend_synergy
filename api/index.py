@@ -1,13 +1,12 @@
 from fastapi import FastAPI
 import os, os.path as op
 
-# === ENV (gunakan .env Vercel di dashboard untuk produksi) ===
 DEFAULT_FREQ = os.getenv("DEFAULT_FREQ", "D")
 MODEL_PATH = os.getenv("MODEL_PATH", "artifacts/sarimax_model.pkl")
 TRAIN_CSV  = os.getenv("TRAIN_CSV",  "artifacts/train_df.csv")
 TEST_CSV   = os.getenv("TEST_CSV",   "artifacts/test_df.csv")
 
-app = FastAPI(title="Forecast Backend (SARIMAX) — Vercel", version="0.1.0")
+app = FastAPI(title="Forecast Backend — Vercel", version="0.1.0")
 
 @app.get("/api/healthz")
 def healthz():
