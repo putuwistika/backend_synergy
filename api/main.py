@@ -7,26 +7,40 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, ConfigDict
 
 from model import read_train_meta, next_dates_from_train, forecast
 from services import build_auto_exog, interpret_message, evaluate_on_test
 
-# ============== ENV ==============
+# ================= ENV =================
 DEFAULT_FREQ = os.getenv("DEFAULT_FREQ", "D")
 MODEL_PATH   = os.getenv("MODEL_PATH", "artifacts/sarimax_model.pkl")
 TRAIN_CSV    = os.getenv("TRAIN_CSV",  "artifacts/train_df.csv")
 TEST_CSV     = os.getenv("TEST_CSV",   "artifacts/test_df.csv")
+ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*")
+ALLOW_ORIGINS = [o.strip() for o in ALLOW_ORIGINS_ENV.split(",")] if ALLOW_ORIGINS_ENV else ["*"]
 
-app = FastAPI(title="Forecast Backend (SARIMAX) — Vercel", version="0.3.0")
+app = FastAPI(title="Forecast Backend (SARIMAX) — Railway", version="0.3.1")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if ALLOW_ORIGINS == ["*"] else ALLOW_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ================= Pydantic Base (fix warning protected_namespaces) =================
+class BaseSchema(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())  # allow fields like model_name
 
 
-# --------- Schemas ----------
-class Flags(BaseModel):
+# ================= Schemas =================
+class Flags(BaseSchema):
     use_auto_exog: Optional[bool] = False
 
-
-class PredictRequest(BaseModel):
+class PredictRequest(BaseSchema):
     horizon: int = Field(..., ge=1, le=365)
     frequency: str = "D"
     alpha: float = 0.05
@@ -34,15 +48,13 @@ class PredictRequest(BaseModel):
     exog: Optional[Dict[str, List[List[float]]]] = None
     flags: Optional[Flags] = Flags()
 
-
-class ForecastPoint(BaseModel):
+class ForecastPoint(BaseSchema):
     ds: str
     yhat: float
     yhat_lower: Optional[float] = None
     yhat_upper: Optional[float] = None
 
-
-class PredictResponse(BaseModel):
+class PredictResponse(BaseSchema):
     model_name: str
     generated_at: str
     horizon: int
@@ -52,21 +64,18 @@ class PredictResponse(BaseModel):
     forecasts: List[ForecastPoint]
     warnings: List[str]
 
-
-class ChatReq(BaseModel):
+class ChatReq(BaseSchema):
     message: str
     alpha: float = 0.05
 
 
-# --------- Internal helpers to register both "/" and "/api/*" ---------
+# ================= Internal helpers (shared handlers) =================
 def _healthz():
     return {"status": "ok"}
-
 
 def _readyz():
     missing = [p for p in [MODEL_PATH, TRAIN_CSV, TEST_CSV] if not op.exists(p)]
     return {"ready": len(missing) == 0, "missing": missing}
-
 
 def _meta():
     m = read_train_meta()
@@ -81,6 +90,7 @@ def _meta():
         "date_col": m.get("date_col"),
         "target_col": m.get("target_col"),
         "exog_columns": m.get("exog_columns", []),
+        "exog_columns_from_model": m.get("exog_names_from_model"),
         "train_range": m.get("train_range"),
         "model_order": m.get("model_order"),
         "model_seasonal_order": m.get("model_seasonal_order"),
@@ -88,10 +98,10 @@ def _meta():
     }
 
 
-# --------- Routes (root & /api/*) ---------
+# ================= Routes (root & /api/* mirrors) =================
 @app.get("/")
 def root():
-    return {"ok": True, "service": "forecast-backend", "version": "0.3.0"}
+    return {"ok": True, "service": "forecast-backend", "version": "0.3.1"}
 
 @app.get("/healthz")
 def healthz_root(): return _healthz()
@@ -112,7 +122,7 @@ def meta_root(): return _meta()
 def meta_api(): return _meta()
 
 
-# --------- Predict ---------
+# ================= Predict =================
 @app.post("/predict", response_model=PredictResponse)
 @app.post("/api/predict", response_model=PredictResponse)
 def api_predict(req: PredictRequest):
@@ -133,7 +143,7 @@ def api_predict(req: PredictRequest):
             warnings.extend(w)
             mode = "auto"
         else:
-            # Manual exog expected
+            # Manual exog expected: {"columns":[...], "rows":[[...], ...]}
             if not req.exog:
                 raise HTTPException(
                     status_code=400,
@@ -158,7 +168,7 @@ def api_predict(req: PredictRequest):
     if out is None:
         raise HTTPException(
             status_code=503,
-            detail="Model not loaded or forecasting failed. Ensure artifacts/sarimax_model.pkl exists & is compatible with statsmodels."
+            detail="Model not loaded or forecasting failed. Check artifacts & statsmodels compatibility."
         )
     mean, lower, upper = out
     dates = next_dates_from_train(h, freq=freq)
@@ -185,7 +195,7 @@ def api_predict(req: PredictRequest):
     )
 
 
-# --------- Chat → Forecast ---------
+# ================= Chat → Forecast (Flow C) =================
 @app.post("/chat/forecast")
 @app.post("/api/chat/forecast")
 def chat_forecast(body: ChatReq):
@@ -196,10 +206,10 @@ def chat_forecast(body: ChatReq):
         alpha=body.alpha,
         flags=parsed.get("flags")
     )
-    return api_predict(req)  # delegate
+    return api_predict(req)  # delegate ke handler di atas
 
 
-# --------- Metrics (tanpa upload) ---------
+# ================= Metrics (tanpa upload) =================
 @app.get("/metrics")
 @app.get("/api/metrics")
 def api_metrics(
