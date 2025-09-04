@@ -56,13 +56,15 @@ def _to_float_or_zero(v) -> float:
 def _expected_exog_cols(meta: dict) -> List[str]:
     """
     Ambil urutan exog dari model (training-time) kalau ada; jika tidak, pakai meta.exog_columns.
+    Buang 'const'/'intercept' karena SARIMAX menambahkan konstanta internal.
     """
     names = meta.get("exog_names_from_model")
-    if names and isinstance(names, list):
-        return names
-    return meta.get("exog_columns", []) or []
+    if not names:
+        names = meta.get("exog_columns", []) or []
+    cleaned = [c for c in names if str(c).lower() not in ("const", "intercept")]
+    return cleaned
 
-# ===================== AUTO-EXOG =====================
+# ===================== AUTO-EXOG (opsional, masih berguna) =====================
 def build_auto_exog(h: int, exog_cols: List[str]) -> Tuple[List[List[float]], Dict[str, Any], List[str]]:
     """
     Baseline ringan: isi 0.0 untuk semua kolom exog (aman untuk 'tanpa exog').

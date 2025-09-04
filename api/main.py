@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import os.path as op
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
@@ -17,7 +16,7 @@ from model import (
     load_model,                  # for /readyz
     reload_model_from_gridfs,    # for /admin/reload
 )
-from services import build_auto_exog, interpret_message, evaluate_on_test
+from services import interpret_message, evaluate_on_test  # build_auto_exog tidak diperlukan lagi
 
 # ================== ENV ==================
 MONGODB_URI       = os.getenv("MONGODB_URI")
@@ -32,7 +31,7 @@ ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*")
 ALLOW_ORIGINS     = [o.strip() for o in ALLOW_ORIGINS_ENV.split(",")] if ALLOW_ORIGINS_ENV else ["*"]
 
 # ================== APP & CORS ==================
-app = FastAPI(title="Forecast Backend (SARIMAX + Mongo GridFS)", version="0.5.0")
+app = FastAPI(title="Forecast Backend (SARIMAX + Mongo GridFS)", version="0.5.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -81,8 +80,7 @@ class ChatReq(BaseSchema):
 # ================== Health helpers ==================
 def _ping_mongo() -> Dict[str, Any]:
     """
-    Cek koneksi Mongo + info ringan koleksi. Tidak melempar error;
-    kembalikan status + error msg bila ada.
+    Cek koneksi Mongo + info ringan koleksi.
     """
     info: Dict[str, Any] = {"connected": False, "error": None, "collections": {}}
     try:
@@ -172,12 +170,14 @@ def _meta():
 # ================== Exog alignment helpers ==================
 def _expected_exog_cols(meta: dict) -> List[str]:
     """
-    Ambil urutan exog dari model (training-time) kalau ada; kalau tidak, pakai meta.exog_columns.
+    Ambil urutan exog dari model (training-time) kalau ada; lalu
+    buang 'const'/'intercept' karena SARIMAX menambahkan konstanta internal.
     """
     names = meta.get("exog_names_from_model")
-    if names and isinstance(names, list):
-        return names
-    return meta.get("exog_columns", []) or []
+    if not names:
+        names = meta.get("exog_columns", []) or []
+    cleaned = [c for c in names if str(c).lower() not in ("const", "intercept")]
+    return cleaned
 
 def _align_manual_exog(provided: Dict[str, List[List[float]]], expected_cols: List[str], h: int):
     """
@@ -220,7 +220,7 @@ def _align_manual_exog(provided: Dict[str, List[List[float]]], expected_cols: Li
 # ================== Routes (root & /api/* mirrors) ==================
 @app.get("/")
 def root():
-    return {"ok": True, "service": "forecast-backend", "version": "0.5.0"}
+    return {"ok": True, "service": "forecast-backend", "version": "0.5.1"}
 
 @app.get("/healthz")
 def healthz_root(): return _healthz()
@@ -247,7 +247,7 @@ def api_predict(req: PredictRequest):
     # Refresh meta supaya tidak pakai cache lama
     meta = read_train_meta(force_reload=True)
 
-    # Selalu ikuti kolom ekspektasi dari model (kalau ada)
+    # Selalu ikuti kolom ekspektasi dari model (tanpa const/intercept)
     expected_cols = _expected_exog_cols(meta)
     h = req.horizon
     freq = (req.frequency or meta.get("freq") or "D").upper()
@@ -353,9 +353,13 @@ def admin_reload_model():
 @app.get("/api/debug/exog")
 def debug_exog():
     m = read_train_meta(force_reload=True)
+    raw_from_model = m.get("exog_names_from_model")
+    cleaned = _expected_exog_cols(m)
     return {
-        "expected_exog_from_model": m.get("exog_names_from_model"),
-        "exog_columns_meta": m.get("exog_columns"),
+        "expected_exog_from_model_raw": raw_from_model,   # bisa berisi 'const'
+        "expected_exog_used_by_forecast": cleaned,        # tanpa 'const'/'intercept'
+        "len_raw": (len(raw_from_model) if raw_from_model else 0),
+        "len_used": len(cleaned),
         "freq": m.get("freq"),
         "train_range": m.get("train_range"),
     }
